@@ -1,0 +1,21 @@
+# venv and Python cache
+.venv/
+__pycache__/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data: keep big files out; allow tiny samples
+data/**
+!data/sample/**
+!data/.gitkeep
+
+# Zarr stores (prefer outside the repo)
+*.zarr/
+
+# Raster/vector artifacts
+*.tif
+*.tiff
+*.jp2
+*.cog.tif
+*.geotiff
