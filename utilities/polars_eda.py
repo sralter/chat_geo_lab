@@ -62,14 +62,14 @@ def missingness(lf: Frameish, top: Optional[int] = 20) -> pl.DataFrame:
     """Null count & percentage per column, sorted desc by nulls."""
     lf = as_lazy(lf)
     cols = lf.columns
-    exprs = [pl.len().alias("_rows")] + [pl.col(c).null_count().alias(c) for c in cols]
-    counts = lf.select(exprs).collect(streaming=True)
-    n = int(counts["_rows"][0])
+    # don't rely on alias names; take the first series directly
+    counts = lf.select(
+        [pl.len()] + [pl.col(c).null_count().alias(c) for c in cols]
+    ).collect(streaming=True)
+    n = int(counts.to_series(0).item())
     data = (
         pl.DataFrame({"column": cols, "nulls": [int(counts[c][0]) for c in cols]})
-        .with_columns(
-            pl.col("nulls"), (pl.col("nulls") / pl.lit(n) * 100).alias("null_pct")
-        )
+        .with_columns((pl.col("nulls") / pl.lit(n) * 100).alias("null_pct"))
         .sort("nulls", descending=True)
     )
     return data.head(top) if top else data
@@ -89,17 +89,13 @@ def cardinality(lf: Frameish, top: Optional[int] = 50) -> pl.DataFrame:
 # ---------- value counts / duplicates ----------
 
 
-def value_counts(lf: Frameish, column: str, k: int = 20) -> pl.DataFrame:
-    """Top-k value counts for a single column (streaming)."""
+def value_counts(lf: Frameish, column: str, k: Optional[int] = 20) -> pl.DataFrame:
+    """Top-k (or all, if k is None/<=0) value counts for a single column (streaming)."""
     lf = as_lazy(lf)
-    return (
-        lf.group_by(pl.col(column))
-        .len()
-        .sort(pl.col("len"), descending=True)
-        .limit(k)
-        .collect(streaming=True)
-        .rename({"len": "count"})
-    )
+    q = lf.group_by(pl.col(column)).len().sort(pl.col("len"), descending=True)
+    if k and k > 0:
+        q = q.limit(k)
+    return q.collect(streaming=True).rename({"len": "count"})
 
 
 def duplicate_rows(
@@ -117,6 +113,22 @@ def duplicate_rows(
         .filter(pl.col("len") > 1)
         .sort(pl.col("len"), descending=True)
         .limit(k)
+        .collect(streaming=True)
+        .rename({"len": "dupe_count"})
+    )
+
+
+def duplicate_rows_full(
+    lf: Frameish, subset: Optional[List[str]] = None
+) -> pl.DataFrame:
+    """All duplicates for the subset (no limit). Can be large."""
+    lf = as_lazy(lf)
+    keys = subset or lf.columns
+    return (
+        lf.group_by([pl.col(c) for c in keys])
+        .len()
+        .filter(pl.col("len") > 1)
+        .sort(pl.col("len"), descending=True)
         .collect(streaming=True)
         .rename({"len": "dupe_count"})
     )
@@ -162,20 +174,60 @@ def numeric_summary(lf: Frameish) -> pl.DataFrame:
 
 def corr_matrix(
     lf: Frameish,
-    method: str = "pearson",
+    method: str = "pearson",  # 'pearson' or 'spearman'
     limit_rows: int = 1_000_000,
+    drop_nulls: bool = True,  # pairwise NA handling: simple drop of any-row-with-NA
 ) -> pl.DataFrame:
     """
-    Correlation matrix over numeric columns. Collects up to `limit_rows`.
-    For very large data, raise/lower the limit for speed/memory tradeoff.
+    Correlation matrix over numeric columns.
+    - Collects up to `limit_rows` rows for speed/memory control.
+    - Works on older Polars versions that lack DataFrame.corr(method=...).
+    - For 'spearman', ranks each column then computes Pearson on the ranks.
     """
+    import numpy as np
+
     lf = as_lazy(lf)
+
+    # pick numeric columns
     num_cols = [c for c, dt in lf.schema.items() if dt in pl.NUMERIC_DTYPES]
     if not num_cols:
         return pl.DataFrame()
-    df = lf.select(num_cols).limit(limit_rows).collect()
-    # Polars DataFrame.corr returns a (cols x cols) matrix
-    return df.corr(method=method)
+
+    # sample rows + basic NA handling
+    lsel = lf.select(num_cols).limit(limit_rows)
+    if drop_nulls:
+        lsel = lsel.drop_nulls()
+    df = lsel.collect()
+
+    if df.height == 0 or df.width == 0:
+        return pl.DataFrame()
+
+    cols = df.columns
+
+    # For Spearman: rank columns first (average rank for ties)
+    if method.lower() == "spearman":
+        df = df.select([pl.col(c).rank(method="average").alias(c) for c in cols])
+    elif method.lower() != "pearson":
+        raise ValueError("method must be 'pearson' or 'spearman'")
+
+    # convert to numpy, remove zero-variance columns to avoid NaNs
+    arr = df.to_numpy()
+    std = np.nanstd(arr, axis=0)
+    keep = std > 0
+    kept_cols = [c for c, k in zip(cols, keep) if k]
+    if not any(keep):
+        # no variance anywhere -> return empty
+        return pl.DataFrame()
+
+    arr = arr[:, keep]
+
+    # compute correlation
+    cm = np.corrcoef(arr, rowvar=False)
+
+    # build a friendly DataFrame: first column is the row label, then one col per variable
+    out = pl.DataFrame(cm, schema=kept_cols)
+    out = pl.concat([pl.DataFrame({"column": kept_cols}), out], how="horizontal")
+    return out
 
 
 # ---------- datetime quick features ----------
@@ -285,6 +337,132 @@ def _pick_duplicate_key(
     return [cols[0]] if cols else []
 
 
+# ---------- artifact utils (tables and plots) -----------
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _save_table(df: pl.DataFrame, out_path: Path, table_format: str = "csv") -> Path:
+    """Save a Polars DataFrame as CSV or Parquet (default CSV)."""
+    out_path = out_path.with_suffix("." + table_format.lower())
+    _ensure_dir(out_path.parent)
+    if table_format.lower() == "parquet":
+        df.write_parquet(out_path)
+    else:
+        df.write_csv(out_path)
+    return out_path
+
+
+def _maybe_import_seaborn():
+    try:
+        import seaborn as sns  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def plot_corr_lower_triangle(
+    cm_df: pl.DataFrame,
+    out_png: Path,
+    title: str = "Correlation",
+    cmap: str = "coolwarm",
+    dpi: int = 200,
+) -> Path:
+    """
+    Draw a lower-triangle heatmap from the correlation matrix returned by corr_matrix().
+    Expects a frame with a 'column' label column and symmetric numeric columns.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    _ensure_dir(out_png.parent)
+    pdf = cm_df.to_pandas()
+    pdf = pdf.set_index("column")
+    data = pdf.loc[:, pdf.columns]  # square
+
+    # mask upper triangle
+    mask = np.triu(np.ones_like(data, dtype=bool))
+
+    use_sns = _maybe_import_seaborn()
+    plt.figure(figsize=(max(8, len(data) * 0.35), max(6, len(data) * 0.35)))
+    if use_sns:
+        import seaborn as sns
+
+        ax = sns.heatmap(
+            data,
+            mask=mask,
+            cmap=cmap,
+            vmin=-1,
+            vmax=1,
+            square=True,
+            cbar=True,
+            linewidths=0.0,
+        )
+    else:
+        # fallback to plain matplotlib
+        mdata = data.mask(mask)
+        plt.imshow(mdata, vmin=-1, vmax=1, cmap=cmap)
+        plt.colorbar()
+        plt.xticks(range(len(data.columns)), data.columns, rotation=90)
+        plt.yticks(range(len(data.index)), data.index)
+        ax = plt.gca()
+
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=dpi)
+    plt.close()
+    return out_png
+
+
+def plot_topk_bar(
+    df: pl.DataFrame,
+    x: str,
+    y: str,
+    out_png: Path,
+    title: str,
+    horizontal: bool = True,
+    dpi: int = 200,
+) -> Path:
+    """
+    Simple bar plot for top-k value counts or other summaries.
+    Uses seaborn if available, else matplotlib.
+    """
+    import matplotlib.pyplot as plt
+
+    _ensure_dir(out_png.parent)
+    pdf = df.to_pandas()
+
+    use_sns = _maybe_import_seaborn()
+    plt.figure(figsize=(10, max(4, min(0.35 * len(pdf), 16))))
+    if horizontal:
+        if use_sns:
+            import seaborn as sns
+
+            sns.barplot(data=pdf, x=y, y=x)
+        else:
+            plt.barh(pdf[x], pdf[y])
+        plt.xlabel(y)
+        plt.ylabel(x)
+    else:
+        if use_sns:
+            import seaborn as sns
+
+            sns.barplot(data=pdf, x=x, y=y)
+        else:
+            plt.bar(pdf[x], pdf[y])
+        plt.ylabel(y)
+        plt.xticks(rotation=90)
+
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=dpi)
+    plt.close()
+    return out_png
+
+
 def run_quick_eda(
     x: Union[pl.DataFrame, pl.LazyFrame, str, Path, Iterable[Union[str, Path]]],
     *,
@@ -292,15 +470,24 @@ def run_quick_eda(
     missing_top: Optional[int] = 20,
     cardinality_top: Optional[int] = 20,
     value_counts_col: Optional[str] = None,
-    value_counts_k: int = 20,
+    value_counts_k: Optional[int] = 20,  # now Optional: None => all
     duplicate_subset: Optional[list[str]] = None,
     duplicate_k: int = 20,
     corr_limit_rows: int = 300_000,
     corr_method: str = "pearson",
     show_columns: bool = True,
+    artifacts_dir: Optional[
+        Union[str, Path]
+    ] = None,  # save full tables & plots here if set
+    table_format: str = "csv",  # "csv" or "parquet"
+    make_plots: bool = True,  # also emit PNGs when artifacts_dir is set
+    plot_dpi: int = 200,
 ) -> None:
     """One-call EDA: prints overview, missingness, cardinality, value counts, dupes, numeric summary, and correlations."""
     lf = as_lazy(x)
+    outdir = Path(artifacts_dir) if artifacts_dir else None
+    if outdir:
+        _ensure_dir(outdir)
 
     # Column list (before anything else)
     if show_columns:
@@ -320,20 +507,42 @@ def run_quick_eda(
 
     # Missingness
     print("\n=== Missingness (top) ===")
-    print(missingness(lf, top=missing_top))
+    miss_df = missingness(lf, top=missing_top)
+    print(miss_df)
+    if outdir:
+        # full table (not top-restricted)
+        miss_full = missingness(lf, top=None)
+        _save_table(miss_full, outdir / "missingness", table_format)
 
     # Cardinality
     print("\n=== Cardinality (n_unique, top) ===")
-    print(cardinality(lf, top=cardinality_top))
+    card_df = cardinality(lf, top=cardinality_top)
+    print(card_df)
+    if outdir:
+        card_full = cardinality(lf, top=None)
+        _save_table(card_full, outdir / "cardinality", table_format)
 
     # Value counts
     vc_col = value_counts_col or _pick_value_counts_col(lf, nunique)
     if vc_col:
-        print(f"\n=== Value Counts: {vc_col} (top {value_counts_k}) ===")
-        try:
-            print(value_counts(lf, vc_col, k=value_counts_k))
-        except Exception as e:
-            print(f"[!] value_counts failed for {vc_col}: {e}")
+        print(
+            f"\n=== Value Counts: {vc_col} (top {value_counts_k if value_counts_k else 'all'}) ==="
+        )
+        vc_top_df = value_counts(lf, vc_col, k=value_counts_k)
+        print(vc_top_df)
+        if outdir:
+            vc_all_df = value_counts(lf, vc_col, k=None)
+            _save_table(vc_all_df, outdir / f"value_counts__{vc_col}", table_format)
+            if make_plots:
+                plot_topk_bar(
+                    vc_top_df,
+                    x=vc_col,
+                    y="count",
+                    out_png=outdir / f"value_counts__{vc_col}.png",
+                    title=f"Top value counts: {vc_col}",
+                    horizontal=True,
+                    dpi=plot_dpi,
+                )
     else:
         print("\n[!] No suitable column found for value counts.")
 
@@ -341,14 +550,35 @@ def run_quick_eda(
     dupe_keys = duplicate_subset or _pick_duplicate_key(lf, nunique, n_rows)
     print(f"\n=== Duplicate Rows by {dupe_keys} (top {duplicate_k}) ===")
     try:
-        print(duplicate_rows(lf, subset=dupe_keys, k=duplicate_k))
+        dupe_top_df = duplicate_rows(lf, subset=dupe_keys, k=duplicate_k)
+        print(dupe_top_df)
+        if outdir:
+            dupe_full_df = duplicate_rows_full(lf, subset=dupe_keys)
+            _save_table(
+                dupe_full_df,
+                outdir / f"duplicates__{'__'.join(dupe_keys)}",
+                table_format,
+            )
+            if make_plots and dupe_top_df.height > 0:
+                plot_topk_bar(
+                    dupe_top_df.rename({dupe_keys[0]: "key"}),
+                    x="key",
+                    y="dupe_count",
+                    out_png=outdir / f"duplicates__{'__'.join(dupe_keys)}.png",
+                    title=f"Top duplicates by {', '.join(dupe_keys)}",
+                    horizontal=True,
+                    dpi=plot_dpi,
+                )
     except Exception as e:
         print(f"[!] duplicate_rows failed for {dupe_keys}: {e}")
 
     # Numeric summary
     print("\n=== Numeric Summary ===")
     try:
-        print(numeric_summary(lf))
+        numsum_df = numeric_summary(lf)
+        print(numsum_df)
+        if outdir:
+            _save_table(numsum_df, outdir / "numeric_summary", table_format)
     except Exception as e:
         print(f"[!] numeric_summary failed: {e}")
 
@@ -359,17 +589,43 @@ def run_quick_eda(
     try:
         cm = corr_matrix(lf, method=corr_method, limit_rows=corr_limit_rows)
         print(cm)
+        if outdir and cm.height > 0 and "column" in cm.columns:
+            _save_table(cm, outdir / "correlation_matrix", table_format)
+            if make_plots:
+                plot_corr_lower_triangle(
+                    cm,
+                    out_png=outdir / "correlation_matrix.png",
+                    title=f"Correlation ({corr_method})",
+                    dpi=plot_dpi,
+                )
     except Exception as e:
         print(f"[!] corr_matrix failed: {e}")
 
 
 # Example usage
-# from polars_eda import run_quick_eda
+# from utilities.polars_eda import run_quick_eda
 
-# run_quick_eda([
-#     "/Users/sra/Downloads/DE1_0_2008_to_2010_Carrier_Claims_Sample_1A.parquet",
-#     "/Users/sra/Downloads/DE1_0_2008_to_2010_Carrier_Claims_Sample_1B.parquet",
-# ])
-
-# # Override defaults if you want:
-# # run_quick_eda(paths, value_counts_col="HCPCS_CD_4", duplicate_subset=["CLM_ID"], corr_limit_rows=200_000)
+# run_quick_eda(
+#     [
+#         "../data/sample_data/DE1_0_2008_to_2010_Carrier_Claims_Sample_1A.parquet",
+#         "../data/sample_data/DE1_0_2008_to_2010_Carrier_Claims_Sample_1B.parquet",
+#     ],
+#     artifacts_dir="../eda_artifacts",  # folder will be created
+#     table_format="csv",                # or "parquet"
+#     make_plots=True,                   # emit PNGs alongside tables
+#     value_counts_k=30,                 # show top-30 in console/plot, save ALL to CSV
+#     corr_limit_rows=300_000,           # you already had this
+# )
+#
+# outputs:
+#
+# ../eda_artifacts/
+#   missingness.csv
+#   cardinality.csv
+#   value_counts__HCPCS_CD_4.csv
+#   value_counts__HCPCS_CD_4.png
+#   duplicates__CLM_ID.csv
+#   duplicates__CLM_ID.png
+#   numeric_summary.csv
+#   correlation_matrix.csv
+#   correlation_matrix.png   <-- lower-triangle heatmap (blue↔red)

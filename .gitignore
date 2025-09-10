@@ -1,4 +1,5 @@
 secrets/
+eda_artifacts/
 
 # venv and Python cache
 .venv/
