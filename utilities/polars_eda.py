@@ -30,7 +30,9 @@ def as_lazy(x: Union[Frameish, Pathish, Iterable[Pathish]]) -> pl.LazyFrame:
 
 
 def _n_rows(lf: pl.LazyFrame) -> int:
-    return int(lf.select(pl.len().alias("_n")).collect(streaming=True)["_n"][0])
+    # Robust across Polars versions: grab the first (and only) value of the single-agg result
+    out = lf.select(pl.len()).collect(streaming=True)
+    return int(out.to_series(0).item())
 
 
 # ---------- quick peeks ----------
